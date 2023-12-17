@@ -1,33 +1,35 @@
 use std::{
+    error::Error,
     path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use futures::future::join_all;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt, runtime::Runtime};
-use tokio_utils::RateLimiter;
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use chrono::prelude::*;
 
 use ping_the_internet::{
-    file::{read_class_b, save_class_b, ClassBResults, ClassCResults},
-    ping::ping,
+    file::{read_class_b, save_class_b},
+    ping::{init_pinger_pool, ping},
     stats::{print_stats_table_header, print_stats_table_row, Analysis},
-    subnet::{Subnet, SubnetClass},
+    subnet::{ClassBResult, ClassCResult, Subnet, SubnetClass, SubnetClassResults},
 };
 
-fn main() {
-    let mut rt = Runtime::new().unwrap();
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let addr =
+        if let Some(addr) = std::env::args().nth(1) {
+            addr.parse().unwrap()
+        } else {
+            [1, 0, 0, 0].into()
+        };
 
-    let addr = if let Some(addr) = std::env::args().nth(1) {
-        addr.parse().unwrap()
-    } else {
-        [1, 0, 0, 0].into()
-    };
+    init_pinger_pool().await;
 
     print_stats_table_header();
 
@@ -36,8 +38,8 @@ fn main() {
     for b in Subnet::iter_class_b_subnets(addr) {
         let start_time = Instant::now();
 
-        if let Some(results) = ping_class_b(b, &mut rt).unwrap() {
-            let anal = Analysis::of_class_b(results);
+        if let Some(results) = ping_class_b(b).await? {
+            let anal = Analysis::of_subnet(SubnetClassResults::ClassB(results));
             print_stats_table_row(b, Some(anal), false);
 
             println!(
@@ -46,50 +48,61 @@ fn main() {
                 global_start_time.elapsed()
             );
         } else {
-            println!("| {:>11} | {:^57} |", format!("{b}"), "Skipped");
+            println!("| {:>13} | {:^57} |", format!("{b}"), "Skipped");
         }
     }
+
+    Ok(())
 }
 
-fn ping_class_b(
-    subnet: Subnet,
-    rt: &mut Runtime,
-) -> Result<Option<Box<ClassBResults>>, std::io::Error> {
+async fn ping_class_b(subnet: Subnet) -> Result<Option<ClassBResult>, std::io::Error> {
     assert_eq!(subnet.class(), SubnetClass::B);
 
-    rt.block_on(async {
-        if read_class_b(subnet).await.unwrap().is_some() {
-            return Ok(None);
-        }
+    if read_class_b(subnet).await.unwrap().is_some() {
+        return Ok(None);
+    }
 
-        let rate_limiter = RateLimiter::new(Duration::from_millis(30));
+    let class_cs = subnet.iter_subnets().map(ping_class_c);
 
-        let class_cs = subnet
-            .iter_subnets()
-            .map(ping_class_c)
-            .map(|c| rate_limiter.throttle(|| c));
+    let results: ClassBResult = Arc::new(
+        join_all(class_cs)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .unwrap(),
+    );
 
-        let results: Arc<Box<ClassBResults>> = Arc::new(Box::new(
-            join_all(class_cs)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-                .try_into()
-                .unwrap(),
-        ));
+    // start of test
 
-        save_class_b(subnet, results.clone()).await?;
+    // let mut results = Vec::with_capacity(256);
 
-        Ok(Some(Arc::try_unwrap(results).unwrap()))
-    })
+    // for class_c in class_cs {
+    //     results.push(class_c.await);
+    // }
+
+    // let results: ClassBResult = Arc::new(
+    //     results
+    //         .into_iter()
+    //         .collect::<Result<Vec<_>, _>>()?
+    //         .try_into()
+    //         .unwrap(),
+    // );
+
+    // end of test
+
+    save_class_b(subnet, results.clone()).await?;
+
+    Ok(Some(results))
 }
 
-async fn ping_class_c(subnet: Subnet) -> Result<Option<ClassCResults>, std::io::Error> {
+async fn ping_class_c(subnet: Subnet) -> Result<Option<ClassCResult>, std::io::Error> {
+    // println!("pinging subnet {}", subnet);
     let results = join_all(subnet.iter_addresses().map(ping)).await;
 
-    let results = results.try_into().unwrap();
+    let results: ClassCResult = Arc::new(results.try_into().unwrap());
 
-    let anal = Analysis::of_class_c(&results);
+    let anal = Analysis::of_subnet(SubnetClassResults::ClassC(results.clone()));
     print_stats_table_row(subnet, Some(anal.clone()), true);
 
     static FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -111,11 +124,12 @@ async fn ping_class_c(subnet: Subnet) -> Result<Option<ClassCResults>, std::io::
         );
 
         let file_path = Path::new(".").join("data").join("failures.log");
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(file_path)
-            .await?;
+        let mut file =
+            OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file_path)
+                .await?;
 
         file.write_all(format!("[{}] {}\n", Local::now(), subnet).as_bytes())
             .await?;

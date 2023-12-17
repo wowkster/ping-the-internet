@@ -1,7 +1,9 @@
 use crate::{
-    file::{ClassBResults, ClassCResults},
     ping::PingResult,
-    subnet::{Subnet, SubnetClass},
+    subnet::{
+        ClassAResult, ClassBResult, ClassCResult, ClassDResult, Subnet, SubnetClass,
+        SubnetClassResults,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,7 @@ impl Analysis {
         let power = match self.class {
             SubnetClass::B => 16,
             SubnetClass::C => 8,
+            SubnetClass::D => 0,
             _ => unreachable!(),
         };
 
@@ -48,7 +51,44 @@ impl Analysis {
         self.compute_percent(self.errored)
     }
 
-    pub fn of_class_b(results: Box<ClassBResults>) -> Self {
+    pub fn of_subnet(results: SubnetClassResults) -> Self {
+        match results {
+            SubnetClassResults::ClassA(results) => Self::of_class_a(results),
+            SubnetClassResults::ClassB(results) => Self::of_class_b(results),
+            SubnetClassResults::ClassC(results) => Self::of_class_c(results),
+            SubnetClassResults::ClassD(results) => Self::of_class_d(results),
+        }
+    }
+
+    fn of_class_a(results: ClassAResult) -> Self {
+        let mut anal = Analysis::new(SubnetClass::A);
+
+        for class_b in &*results {
+            let Some(class_b) = class_b else {
+                anal.errored += 65536;
+                continue;
+            };
+
+            for class_c in &**class_b {
+                let Some(class_c) = class_c else {
+                    anal.errored += 256;
+                    continue;
+                };
+
+                for ping_result in &**class_c {
+                    match ping_result {
+                        PingResult::Success(_) => anal.alive += 1,
+                        PingResult::Timeout => anal.timed_out += 1,
+                        PingResult::Error => anal.errored += 1,
+                    }
+                }
+            }
+        }
+
+        anal
+    }
+
+    fn of_class_b(results: ClassBResult) -> Self {
         let mut anal = Analysis::new(SubnetClass::B);
 
         for class_c in &*results {
@@ -57,7 +97,7 @@ impl Analysis {
                 continue;
             };
 
-            for ping_result in class_c {
+            for ping_result in &**class_c {
                 match ping_result {
                     PingResult::Success(_) => anal.alive += 1,
                     PingResult::Timeout => anal.timed_out += 1,
@@ -69,10 +109,10 @@ impl Analysis {
         anal
     }
 
-    pub fn of_class_c(results: &ClassCResults) -> Self {
+    fn of_class_c(results: ClassCResult) -> Self {
         let mut anal = Analysis::new(SubnetClass::C);
 
-        for ping_result in results {
+        for ping_result in &*results {
             match ping_result {
                 PingResult::Success(_) => anal.alive += 1,
                 PingResult::Timeout => anal.timed_out += 1,
@@ -82,20 +122,32 @@ impl Analysis {
 
         anal
     }
+
+    fn of_class_d(ping_result: ClassDResult) -> Self {
+        let mut anal = Analysis::new(SubnetClass::D);
+
+        match ping_result {
+            PingResult::Success(_) => anal.alive += 1,
+            PingResult::Timeout => anal.timed_out += 1,
+            PingResult::Error => anal.errored += 1,
+        }
+
+        anal
+    }
 }
 
 pub fn print_stats_table_header() {
     println!(
-        "| {:^11} | {:^17} | {:^17} | {:^17} |",
+        "| {:^13} | {:^17} | {:^17} | {:^17} |",
         "IP ADDRESS", "SUCCEEDED", "TIMED OUT", "ERRORED",
     );
-    println!("|{:->13}|{:->19}|{:->19}|{:->19}|", "", "", "", "");
+    println!("|{:->15}|{:->19}|{:->19}|{:->19}|", "", "", "", "");
 }
 
-pub fn print_stats_table_row(subnet: Subnet, anal: Option<Analysis>, new_line: bool) {   
+pub fn print_stats_table_row(subnet: Subnet, anal: Option<Analysis>, new_line: bool) {
     if let Some(anal) = anal {
         print!(
-            "| {:>15} | {:>5} | {:>9} | {:>5} | {:>9} | {:>5} | {:>9} |",
+            "| {:>13} | {:>5} | {:>9} | {:>5} | {:>9} | {:>5} | {:>9} |",
             format!("{subnet}"),
             anal.alive,
             format!("({:.2}%)", anal.alive_percent()),
@@ -105,7 +157,7 @@ pub fn print_stats_table_row(subnet: Subnet, anal: Option<Analysis>, new_line: b
             format!("({:.2}%)", anal.errored_percent()),
         );
     } else {
-        print!("| {:>15} | {:^57} |", format!("{subnet}"), "NOT FOUND");
+        print!("| {:>13} | {:^57} |", format!("{subnet}"), "NOT FOUND");
     }
 
     if new_line {

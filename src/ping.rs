@@ -9,9 +9,27 @@ use nom::{
     bytes::complete::{tag, take},
     IResult,
 };
+use simple_pool::ResourcePool;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_icmp_echo::Pinger;
 
-#[derive(Debug)]
+lazy_static::lazy_static! {
+    pub static ref PINGER_POOL: ResourcePool<Pinger> = ResourcePool::new();
+}
+
+pub async fn init_pinger_pool() {
+    const PINGER_POOL_SIZE: usize = 256;
+
+    for _ in 0..PINGER_POOL_SIZE {
+        let pinger = tokio_icmp_echo::Pinger::new()
+            .await
+            .expect("Failed to create tokio_icmp_echo::Pinger ({} open files)");
+
+        PINGER_POOL.append(pinger);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum PingResult {
     Success(Duration),
     Timeout,
@@ -19,7 +37,10 @@ pub enum PingResult {
 }
 
 impl PingResult {
-    pub async fn serialize_into<W: AsyncWrite + Unpin>(&self, mut w: W) -> Result<(), std::io::Error> {
+    pub async fn serialize_into<W: AsyncWrite + Unpin>(
+        &self,
+        mut w: W,
+    ) -> Result<(), std::io::Error> {
         match self {
             PingResult::Success(time) => {
                 w.write_all(&[0]).await?;
@@ -33,7 +54,7 @@ impl PingResult {
 
         Ok(())
     }
-    
+
     pub fn parse_from_bytes(input: &[u8]) -> IResult<&[u8], Self> {
         let success_parser = tag(&[0x00]);
         let timeout_parser = tag(&[0x01]);
@@ -65,16 +86,19 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
     let i = IDENTIFIER.fetch_add(1, Ordering::AcqRel);
     let s = SEQUENCE.fetch_add(1, Ordering::AcqRel);
 
-    // POTENTIAL OPTIMIZATION: Create pool of pingers to avoid socket re-alloc
-    let pinger = tokio_icmp_echo::Pinger::new()
-        .await
-        .expect("Failed to create tokio_icmp_echo::Pinger");
+    let pinger = PINGER_POOL.get().await;
 
-    const RETRY_LIMIT: u16 = 5;
+    const RETRY_LIMIT: u16 = 1;
+    const TIMEOUT_SECONDS: u64 = 4;
 
     for retry_counter in 1..=RETRY_LIMIT {
         let mb_time = pinger
-            .ping(IpAddr::V4(address), i, s, Duration::from_secs(3))
+            .ping(
+                IpAddr::V4(address),
+                i,
+                s,
+                Duration::from_secs(TIMEOUT_SECONDS),
+            )
             .await;
 
         return match mb_time {

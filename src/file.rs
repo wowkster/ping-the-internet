@@ -12,11 +12,8 @@ use tokio::{fs::File, io::AsyncWriteExt};
 
 use crate::{
     ping::PingResult,
-    subnet::{Subnet, SubnetClass},
+    subnet::{ClassBResult, ClassCResult, Subnet, SubnetClass},
 };
-
-pub type ClassCResults = [PingResult; 256];
-pub type ClassBResults = [Option<ClassCResults>; 256];
 
 /// Saves the results of an entire class b subnet to a file
 ///
@@ -24,10 +21,7 @@ pub type ClassBResults = [Option<ClassCResults>; 256];
 /// the ping results for that full subnet. If a class C subnet is missing it is completely omitted
 ///
 /// This allows for a very good compression ration
-pub async fn save_class_b(
-    subnet: Subnet,
-    results: Arc<Box<ClassBResults>>,
-) -> Result<(), std::io::Error> {
+pub async fn save_class_b(subnet: Subnet, results: ClassBResult) -> Result<(), std::io::Error> {
     assert_eq!(
         subnet.class(),
         SubnetClass::B,
@@ -38,14 +32,14 @@ pub async fn save_class_b(
 
     let mut encoder = ZlibEncoder::with_quality(Vec::new(), Level::Best);
 
-    for class_c in &**results {
+    for class_c in &*results {
         match class_c {
             None => {
                 encoder.write_all(&[0x00]).await?;
             }
             Some(class_c) => {
                 encoder.write_all(&[0x01]).await?;
-                for ping_result in class_c {
+                for ping_result in &**class_c {
                     ping_result.serialize_into(&mut encoder).await?;
                 }
             }
@@ -72,7 +66,7 @@ pub async fn save_class_b(
 ///
 /// Returns None if the class b subnet is not found on the disk at all. Otherwise,
 /// returns an array of Options of the class c subnets
-pub async fn read_class_b(subnet: Subnet) -> Result<Option<Box<ClassBResults>>, std::io::Error> {
+pub async fn read_class_b(subnet: Subnet) -> Result<Option<ClassBResult>, std::io::Error> {
     assert_eq!(
         subnet.class(),
         SubnetClass::B,
@@ -105,13 +99,13 @@ pub async fn read_class_b(subnet: Subnet) -> Result<Option<Box<ClassBResults>>, 
     Ok(Some(class_b))
 }
 
-fn parse_class_b(input: &[u8]) -> IResult<&[u8], Box<ClassBResults>> {
+fn parse_class_b(input: &[u8]) -> IResult<&[u8], ClassBResult> {
     let (input, class_b) = count(parse_optional_class_c, 256)(input)?;
 
-    Ok((input, class_b.try_into().unwrap()))
+    Ok((input, Arc::new(class_b.try_into().unwrap())))
 }
 
-fn parse_optional_class_c(input: &[u8]) -> IResult<&[u8], Option<ClassCResults>> {
+fn parse_optional_class_c(input: &[u8]) -> IResult<&[u8], Option<ClassCResult>> {
     let (input, enum_tag) = alt((tag(&[0x00]), tag(&[0x01])))(input)?;
 
     match enum_tag {
@@ -125,10 +119,10 @@ fn parse_optional_class_c(input: &[u8]) -> IResult<&[u8], Option<ClassCResults>>
     }
 }
 
-fn parse_class_c(input: &[u8]) -> IResult<&[u8], ClassCResults> {
+fn parse_class_c(input: &[u8]) -> IResult<&[u8], ClassCResult> {
     let (input, ping_results) = count(PingResult::parse_from_bytes, 256)(input)?;
 
-    Ok((input, ping_results.try_into().unwrap()))
+    Ok((input, Arc::new(ping_results.try_into().unwrap())))
 }
 
 fn create_file_path(subnet: Subnet) -> PathBuf {
