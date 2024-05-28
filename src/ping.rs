@@ -9,27 +9,15 @@ use nom::{
     bytes::complete::{tag, take},
     IResult,
 };
-use simple_pool::ResourcePool;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio_icmp_echo::Pinger;
+
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    sync::Semaphore,
+};
 
 use crate::gui::{Slash32State, SLASH_32_STATES};
 
-lazy_static::lazy_static! {
-    pub static ref PINGER_POOL: ResourcePool<Pinger> = ResourcePool::new();
-}
-
-pub async fn init_pinger_pool() {
-    const PINGER_POOL_SIZE: usize = 1024;
-
-    for _ in 0..PINGER_POOL_SIZE {
-        let pinger = tokio_icmp_echo::Pinger::new()
-            .await
-            .expect("Failed to create tokio_icmp_echo::Pinger ({} open files)");
-
-        PINGER_POOL.append(pinger);
-    }
-}
+pub static PING_PERMITS: Semaphore = Semaphore::const_new(1024);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PingResult {
@@ -88,13 +76,21 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
     let i = IDENTIFIER.fetch_add(1, Ordering::AcqRel);
     let s = SEQUENCE.fetch_add(1, Ordering::AcqRel);
 
-    let pinger = PINGER_POOL.get().await;
+    let permit = PING_PERMITS.acquire().await.unwrap();
+
+    let pinger = tokio_icmp_echo::Pinger::new()
+        .await
+        .expect("Failed to create tokio_icmp_echo::Pinger ({} open files)");
 
     const RETRY_LIMIT: u16 = 2;
-    const TIMEOUT_SECONDS: u64 = 4;
 
     let state_i = address.octets()[2] as usize;
     let state_j = address.octets()[3] as usize;
+
+    tokio::time::sleep(Duration::from_millis(
+        address.octets()[2] as u64 * 4 + rand::random::<u8>() as u64,
+    ))
+    .await;
 
     {
         let mut states = SLASH_32_STATES.lock().unwrap();
@@ -103,12 +99,7 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
 
     for retry_counter in 1..=RETRY_LIMIT {
         let mb_time = pinger
-            .ping(
-                IpAddr::V4(address),
-                i,
-                s,
-                Duration::from_secs(TIMEOUT_SECONDS),
-            )
+            .ping(IpAddr::V4(address), i, s, Duration::from_millis(3500))
             .await;
 
         let result = match mb_time {
@@ -116,12 +107,15 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
             Ok(None) => PingResult::Timeout,
             Err(_) => {
                 if retry_counter < RETRY_LIMIT {
+                    tokio::time::sleep(Duration::from_millis(rand::random::<u8>() as u64)).await;
                     continue;
                 }
 
                 PingResult::Error
             }
         };
+
+        drop(permit);
 
         let state = match result {
             PingResult::Success(_) => Slash32State::Success,
