@@ -1,23 +1,35 @@
+use std::sync::Arc;
+
 use crate::{
     ping::PingResult,
-    subnet::{
-        ClassAResult, ClassBResult, ClassCResult, ClassDResult, Subnet, SubnetClass,
-        SubnetClassResults,
-    },
+    subnet::{Subnet, SubnetMask},
 };
+
+pub type Slash8Result = Arc<[Option<Slash16Result>; 256]>;
+pub type Slash16Result = Arc<[Option<Slash24Result>; 256]>;
+pub type Slash24Result = Arc<[Slash32Result; 256]>;
+pub type Slash32Result = PingResult;
+
+#[derive(Debug, Clone)]
+pub enum SubnetResults {
+    Slash8(Slash8Result),
+    Slash16(Slash16Result),
+    Slash24(Slash24Result),
+    Slash32(Slash32Result),
+}
 
 #[derive(Debug, Clone)]
 pub struct Analysis {
-    pub class: SubnetClass,
+    pub mask: SubnetMask,
     pub alive: u32,
     pub timed_out: u32,
     pub errored: u32,
 }
 
 impl Analysis {
-    fn new(class: SubnetClass) -> Self {
+    fn new(mask: SubnetMask) -> Self {
         Self {
-            class,
+            mask,
             alive: 0,
             timed_out: 0,
             errored: 0,
@@ -25,10 +37,10 @@ impl Analysis {
     }
 
     fn get_max(&self) -> u32 {
-        let power = match self.class {
-            SubnetClass::B => 16,
-            SubnetClass::C => 8,
-            SubnetClass::D => 0,
+        let power = match self.mask {
+            SubnetMask::Slash16 => 16,
+            SubnetMask::Slash24 => 8,
+            SubnetMask::Slash32 => 0,
             _ => unreachable!(),
         };
 
@@ -51,31 +63,31 @@ impl Analysis {
         self.compute_percent(self.errored)
     }
 
-    pub fn of_subnet(results: SubnetClassResults) -> Self {
+    pub fn of_subnet(results: SubnetResults) -> Self {
         match results {
-            SubnetClassResults::ClassA(results) => Self::of_class_a(results),
-            SubnetClassResults::ClassB(results) => Self::of_class_b(results),
-            SubnetClassResults::ClassC(results) => Self::of_class_c(results),
-            SubnetClassResults::ClassD(results) => Self::of_class_d(results),
+            SubnetResults::Slash8(results) => Self::of_slash_8(results),
+            SubnetResults::Slash16(results) => Self::of_slash_16(results),
+            SubnetResults::Slash24(results) => Self::of_slash_24(results),
+            SubnetResults::Slash32(results) => Self::of_slash_32(results),
         }
     }
 
-    fn of_class_a(results: ClassAResult) -> Self {
-        let mut anal = Analysis::new(SubnetClass::A);
+    fn of_slash_8(results: Slash8Result) -> Self {
+        let mut anal = Analysis::new(SubnetMask::Slash8);
 
-        for class_b in &*results {
-            let Some(class_b) = class_b else {
+        for slash_16 in &*results {
+            let Some(slash_16) = slash_16 else {
                 anal.errored += 65536;
                 continue;
             };
 
-            for class_c in &**class_b {
-                let Some(class_c) = class_c else {
+            for slash_24 in &**slash_16 {
+                let Some(slash_24) = slash_24 else {
                     anal.errored += 256;
                     continue;
                 };
 
-                for ping_result in &**class_c {
+                for ping_result in &**slash_24 {
                     match ping_result {
                         PingResult::Success(_) => anal.alive += 1,
                         PingResult::Timeout => anal.timed_out += 1,
@@ -88,16 +100,16 @@ impl Analysis {
         anal
     }
 
-    fn of_class_b(results: ClassBResult) -> Self {
-        let mut anal = Analysis::new(SubnetClass::B);
+    fn of_slash_16(results: Slash16Result) -> Self {
+        let mut anal = Analysis::new(SubnetMask::Slash16);
 
-        for class_c in &*results {
-            let Some(class_c) = class_c else {
+        for slash_24 in &*results {
+            let Some(slash_24) = slash_24 else {
                 anal.errored += 256;
                 continue;
             };
 
-            for ping_result in &**class_c {
+            for ping_result in &**slash_24 {
                 match ping_result {
                     PingResult::Success(_) => anal.alive += 1,
                     PingResult::Timeout => anal.timed_out += 1,
@@ -109,8 +121,8 @@ impl Analysis {
         anal
     }
 
-    fn of_class_c(results: ClassCResult) -> Self {
-        let mut anal = Analysis::new(SubnetClass::C);
+    fn of_slash_24(results: Slash24Result) -> Self {
+        let mut anal = Analysis::new(SubnetMask::Slash24);
 
         for ping_result in &*results {
             match ping_result {
@@ -123,8 +135,8 @@ impl Analysis {
         anal
     }
 
-    fn of_class_d(ping_result: ClassDResult) -> Self {
-        let mut anal = Analysis::new(SubnetClass::D);
+    fn of_slash_32(ping_result: Slash32Result) -> Self {
+        let mut anal = Analysis::new(SubnetMask::Slash32);
 
         match ping_result {
             PingResult::Success(_) => anal.alive += 1,

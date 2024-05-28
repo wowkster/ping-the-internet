@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 
 use ping_the_internet::{
-    file::read_class_b,
-    stats::{print_stats_table_header, print_stats_table_row, Analysis},
-    subnet::{Subnet, SubnetClassResults},
+    file::read_slash_16, stats::{print_stats_table_header, print_stats_table_row, Analysis, SubnetResults}, subnet::Subnet
 };
 
 #[tokio::main]
@@ -16,7 +14,7 @@ async fn main() {
     // a.0.0.0
     for a in Subnet::default().iter_subnets() {
         for b in a.iter_subnets() {
-            let anal = analyze_class_b(b).await.unwrap();
+            let anal = analyze_slash_16(b).await.unwrap();
 
             if let Some(ref anal) = anal {
                 total_pinged += 65536;
@@ -39,12 +37,12 @@ async fn main() {
     );
 }
 
-pub async fn analyze_class_b(subnet: Subnet) -> Result<Option<Analysis>, std::io::Error> {
-    let Some(results) = read_class_b(subnet).await? else {
+pub async fn analyze_slash_16(subnet: Subnet) -> Result<Option<Analysis>, std::io::Error> {
+    let Some(results) = read_slash_16(subnet).await? else {
         return Ok(None);
     };
 
-    let anal = Analysis::of_subnet(SubnetClassResults::ClassB(results));
+    let anal = Analysis::of_subnet(SubnetResults::Slash16(results));
 
     Ok(Some(anal))
 }

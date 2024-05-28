@@ -13,12 +13,14 @@ use simple_pool::ResourcePool;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_icmp_echo::Pinger;
 
+use crate::gui::{Slash32State, SLASH_32_STATES};
+
 lazy_static::lazy_static! {
     pub static ref PINGER_POOL: ResourcePool<Pinger> = ResourcePool::new();
 }
 
 pub async fn init_pinger_pool() {
-    const PINGER_POOL_SIZE: usize = 256;
+    const PINGER_POOL_SIZE: usize = 1024;
 
     for _ in 0..PINGER_POOL_SIZE {
         let pinger = tokio_icmp_echo::Pinger::new()
@@ -29,7 +31,7 @@ pub async fn init_pinger_pool() {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PingResult {
     Success(Duration),
     Timeout,
@@ -88,8 +90,16 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
 
     let pinger = PINGER_POOL.get().await;
 
-    const RETRY_LIMIT: u16 = 1;
+    const RETRY_LIMIT: u16 = 2;
     const TIMEOUT_SECONDS: u64 = 4;
+
+    let state_i = address.octets()[2] as usize;
+    let state_j = address.octets()[3] as usize;
+
+    {
+        let mut states = SLASH_32_STATES.lock().unwrap();
+        states[state_i][state_j] = Slash32State::Pending;
+    }
 
     for retry_counter in 1..=RETRY_LIMIT {
         let mb_time = pinger
@@ -101,7 +111,7 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
             )
             .await;
 
-        return match mb_time {
+        let result = match mb_time {
             Ok(Some(time)) => PingResult::Success(time),
             Ok(None) => PingResult::Timeout,
             Err(_) => {
@@ -109,9 +119,31 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
                     continue;
                 }
 
-                return PingResult::Error;
+                PingResult::Error
             }
         };
+
+        {
+            let i = address.octets()[2] as usize;
+            let j = address.octets()[3] as usize;
+
+            let mut states = SLASH_32_STATES.lock().unwrap();
+
+            states[i][j] = Slash32State::Pending;
+        }
+
+        let state = match result {
+            PingResult::Success(_) => Slash32State::Success,
+            PingResult::Timeout => Slash32State::Timeout,
+            PingResult::Error => Slash32State::Error,
+        };
+
+        {
+            let mut states = SLASH_32_STATES.lock().unwrap();
+            states[state_i][state_j] = state;
+        }
+
+        return result;
     }
 
     unreachable!();

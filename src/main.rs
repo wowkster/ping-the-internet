@@ -1,33 +1,40 @@
 use std::{
     error::Error,
-    path::Path,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    net::Ipv4Addr,
+    sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 
 use futures::future::join_all;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
-
-use chrono::prelude::*;
 
 use ping_the_internet::{
-    file::{read_class_b, save_class_b},
-    ping::{init_pinger_pool, ping},
-    stats::{print_stats_table_header, print_stats_table_row, Analysis},
-    subnet::{ClassBResult, ClassCResult, Subnet, SubnetClass, SubnetClassResults},
+    file::{read_slash_16, save_slash_16},
+    gui::{self, Slash16State, Slash32State, PENDING_SLASH_16, SLASH_16_STATES, SLASH_32_STATES},
+    ping::{init_pinger_pool, ping, PingResult},
+    stats::{
+        print_stats_table_header, print_stats_table_row, Analysis, Slash16Result, SubnetResults,
+    },
+    subnet::{Subnet, SubnetMask},
 };
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let addr =
-        if let Some(addr) = std::env::args().nth(1) {
-            addr.parse().unwrap()
-        } else {
-            [1, 0, 0, 0].into()
-        };
+fn main() {
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(pinger_main())
+            .ok()
+    });
+
+    gui::gui_main();
+}
+
+async fn pinger_main() -> Result<(), Box<dyn Error>> {
+    let base_address: Ipv4Addr = std::env::args()
+        .nth(1)
+        .map(|addr| addr.parse().unwrap())
+        .unwrap_or([1, 0, 0, 0].into());
 
     init_pinger_pool().await;
 
@@ -35,107 +42,111 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let global_start_time = Instant::now();
 
-    for b in Subnet::iter_class_b_subnets(addr) {
-        let start_time = Instant::now();
+    for slash_8 in Subnet::new([0, 0, 0, 0].into(), SubnetMask::Slash0).iter_subnets() {
+        if slash_8.base_address().octets()[0] < base_address.octets()[0] {
+            continue;
+        }
 
-        if let Some(results) = ping_class_b(b).await? {
-            let anal = Analysis::of_subnet(SubnetClassResults::ClassB(results));
-            print_stats_table_row(b, Some(anal), false);
+        for slash_16 in slash_8.iter_subnets() {
+            if slash_8.base_address().octets()[0] == base_address.octets()[0]
+                && slash_16.base_address().octets()[1] < base_address.octets()[1]
+            {
+                continue;
+            }
 
-            println!(
-                " in {:.2?} ({:.2?} total)",
-                start_time.elapsed(),
-                global_start_time.elapsed()
+            let state_i = slash_16.octets()[0] as usize;
+            let state_j = slash_16.octets()[1] as usize;
+
+            PENDING_SLASH_16.store(
+                u16::from_be_bytes([state_i as u8, state_j as u8]),
+                Ordering::Release,
             );
-        } else {
-            println!("| {:>13} | {:^57} |", format!("{b}"), "Skipped");
+
+            {
+                let mut states = SLASH_16_STATES.lock().unwrap();
+                states[state_i][state_j] = Slash16State::Pending;
+            }
+
+            let start_time = Instant::now();
+
+            if let Some(results) = ping_slash_16(slash_16).await? {
+                let anal = Analysis::of_subnet(SubnetResults::Slash16(results));
+
+                print_stats_table_row(slash_16, Some(anal), false);
+
+                println!(
+                    " in {:.2?} ({:.2?} total)",
+                    start_time.elapsed(),
+                    global_start_time.elapsed()
+                );
+
+                {
+                    let mut states = SLASH_16_STATES.lock().unwrap();
+                    states[state_i][state_j] = Slash16State::Completed;
+                }
+            } else {
+                println!("| {:>13} | {:^57} |", format!("{slash_16}"), "Skipped");
+
+                {
+                    let mut states = SLASH_16_STATES.lock().unwrap();
+                    states[state_i][state_j] = Slash16State::Skipped;
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-async fn ping_class_b(subnet: Subnet) -> Result<Option<ClassBResult>, std::io::Error> {
-    assert_eq!(subnet.class(), SubnetClass::B);
+async fn ping_slash_16(slash_16: Subnet) -> Result<Option<Slash16Result>, std::io::Error> {
+    assert_eq!(slash_16.mask(), SubnetMask::Slash16);
 
-    if read_class_b(subnet).await.unwrap().is_some() {
+    if read_slash_16(slash_16).await.unwrap().is_some() {
         return Ok(None);
     }
 
-    let class_cs = subnet.iter_subnets().map(ping_class_c);
+    {
+        let mut states = SLASH_32_STATES.lock().unwrap();
+        *states = [[Slash32State::Scheduled; 256]; 256];
+    }
 
-    let results: ClassBResult = Arc::new(
-        join_all(class_cs)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .unwrap(),
-    );
+    /* Iterate subnets in an order that distributes load more evenly across networks */
 
-    // start of test
+    let mut slash_24_iterators = Vec::with_capacity(256);
 
-    // let mut results = Vec::with_capacity(256);
+    for slash_24 in slash_16.iter_subnets() {
+        slash_24_iterators.push(slash_24.iter_subnets());
+    }
 
-    // for class_c in class_cs {
-    //     results.push(class_c.await);
-    // }
+    let mut slash_32s = Vec::with_capacity(65536);
 
-    // let results: ClassBResult = Arc::new(
-    //     results
-    //         .into_iter()
-    //         .collect::<Result<Vec<_>, _>>()?
-    //         .try_into()
-    //         .unwrap(),
-    // );
+    for _ in 0..256 {
+        for iter in &mut slash_24_iterators {
+            slash_32s.push(ping(iter.next().unwrap().base_address()));
+        }
+    }
 
-    // end of test
+    let ping_results = join_all(slash_32s).await;
 
-    save_class_b(subnet, results.clone()).await?;
+    let mut slash_16_result = Vec::with_capacity(256);
 
-    Ok(Some(results))
-}
+    for slash_24 in 0..256 {
+        let mut slash_24_result = Vec::with_capacity(256);
 
-async fn ping_class_c(subnet: Subnet) -> Result<Option<ClassCResult>, std::io::Error> {
-    // println!("pinging subnet {}", subnet);
-    let results = join_all(subnet.iter_addresses().map(ping)).await;
-
-    let results: ClassCResult = Arc::new(results.try_into().unwrap());
-
-    let anal = Analysis::of_subnet(SubnetClassResults::ClassC(results.clone()));
-    print_stats_table_row(subnet, Some(anal.clone()), true);
-
-    static FAILURES: AtomicU32 = AtomicU32::new(0);
-
-    if anal.errored == 256 {
-        let failures = FAILURES.fetch_add(1, Ordering::AcqRel);
-
-        if failures > 2 * 1024 {
-            eprintln!(
-                "Over 2048 failures! Something is up. Check `./data/failures.log` for more info."
-            );
-            std::process::exit(1);
+        for slash_32 in 0..256 {
+            slash_24_result.push(ping_results[slash_32 * 256 + slash_24].clone())
         }
 
-        eprintln!(
-            "{} => All attempts to ping subnet failed. {} failures so far.",
-            subnet,
-            failures + 1
-        );
-
-        let file_path = Path::new(".").join("data").join("failures.log");
-        let mut file =
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(file_path)
-                .await?;
-
-        file.write_all(format!("[{}] {}\n", Local::now(), subnet).as_bytes())
-            .await?;
-
-        return Ok(None);
+        if slash_24_result.iter().any(|r| *r != PingResult::Timeout) {
+            slash_16_result.push(Some(Arc::new(slash_24_result.try_into().unwrap())))
+        } else {
+            slash_16_result.push(None)
+        }
     }
+
+    let results: Slash16Result = Arc::new(slash_16_result.try_into().unwrap());
+
+    save_slash_16(slash_16, results.clone()).await?;
 
     Ok(Some(results))
 }

@@ -3,7 +3,6 @@ use std::{
     net::Ipv4Addr,
     ops::{Deref, RangeInclusive},
     str::FromStr,
-    sync::Arc,
 };
 
 use nom::{
@@ -13,94 +12,47 @@ use nom::{
     IResult,
 };
 
-use crate::ping::PingResult;
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SubnetClass {
-    All,
-    A,
-    B,
-    C,
-    D,
+pub enum SubnetMask {
+    Slash0,
+    Slash8,
+    Slash16,
+    Slash24,
+    Slash32,
 }
 
-/// A non standard representation of a sub-network. Has a base address and
-/// a "class" which is the number of 1 byte blocks the subnet is authoritative
-/// over and nothing else.
-///
-/// For example the subnet `1.2.x.x` would be class B with a base address of
-/// `1.2.0.0`, and the subnet `12.x.x.x` would be class A with a base address
-/// of `12.0.0.0`.
-///
-/// The `All` class represents the entire internet since it has no bytes
-/// reserved for a subnet id. It always has a base address of `0.0.0.0`.
-/// It is the so called "universal set". On the contrary, class D subnets only
-/// contain a single IP address. They are so called empty sets because they contain
-/// no further elements themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct Subnet {
     base_address: Ipv4Addr,
-    class: SubnetClass,
+    mask: SubnetMask,
 }
 
 impl Subnet {
-    pub fn new(base_address: Ipv4Addr, class: SubnetClass) -> Self {
+    pub fn new(base_address: Ipv4Addr, mask: SubnetMask) -> Self {
         let octets = base_address.octets();
 
-        assert!(match class {
-            SubnetClass::All => matches!(octets, [0, 0, 0, 0]),
-            SubnetClass::A => matches!(octets, [_, 0, 0, 0]),
-            SubnetClass::B => matches!(octets, [_, _, 0, 0]),
-            SubnetClass::C => matches!(octets, [_, _, _, 0]),
-            SubnetClass::D => matches!(octets, [_, _, _, _]),
+        assert!(match mask {
+            SubnetMask::Slash0 => matches!(octets, [0, 0, 0, 0]),
+            SubnetMask::Slash8 => matches!(octets, [_, 0, 0, 0]),
+            SubnetMask::Slash16 => matches!(octets, [_, _, 0, 0]),
+            SubnetMask::Slash24 => matches!(octets, [_, _, _, 0]),
+            SubnetMask::Slash32 => matches!(octets, [_, _, _, _]),
         });
 
-        Self {
-            base_address,
-            class,
-        }
+        Self { base_address, mask }
     }
 
     pub fn base_address(&self) -> Ipv4Addr {
         self.base_address
     }
 
-    pub fn class(&self) -> SubnetClass {
-        self.class
-    }
-
-    /// Iterates through all the addresses in the given subnet
-    pub fn iter_addresses(&self) -> impl Iterator<Item = Ipv4Addr> {
-        let start = u32::from_be_bytes(self.base_address.octets());
-
-        let power = match self.class {
-            SubnetClass::All => 32,
-            SubnetClass::A => 24,
-            SubnetClass::B => 16,
-            SubnetClass::C => 8,
-            SubnetClass::D => 0,
-        };
-        let length = 2u32.pow(power);
-
-        (start..=start + length - 1).map(|a| a.to_be_bytes().into())
+    pub fn mask(&self) -> SubnetMask {
+        self.mask
     }
 
     /// Iterates through all the subnets one class lower than this subnet
     pub fn iter_subnets(&self) -> impl Iterator<Item = Subnet> {
         SubnetIterator::new(*self)
-    }
-
-    /// Iterates through all the class b subnets in the given subnet
-    pub fn iter_class_b_subnets(base_address: Ipv4Addr) -> impl Iterator<Item = Subnet> {
-        let octets = base_address.octets();
-
-        assert!(matches!(octets, [_, _, 0, 0]));
-
-        let start = u32::from_be_bytes(octets);
-        let start = start >> 16;
-
-        (start..=u16::MAX as u32)
-            .map(|a| Subnet::new((a << 16).to_be_bytes().into(), SubnetClass::B))
     }
 }
 
@@ -108,7 +60,7 @@ impl Default for Subnet {
     fn default() -> Self {
         Self {
             base_address: [0, 0, 0, 0].into(),
-            class: SubnetClass::All,
+            mask: SubnetMask::Slash0,
         }
     }
 }
@@ -125,12 +77,14 @@ impl Display for Subnet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let octets = self.base_address.octets();
 
-        match self.class {
-            SubnetClass::All => write!(f, "x.x.x.x"),
-            SubnetClass::A => write!(f, "{}.x.x.x", octets[0]),
-            SubnetClass::B => write!(f, "{}.{}.x.x", octets[0], octets[1]),
-            SubnetClass::C => write!(f, "{}.{}.{}.x", octets[0], octets[1], octets[2]),
-            SubnetClass::D => write!(f, "{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]),
+        match self.mask {
+            SubnetMask::Slash0 => write!(f, "x.x.x.x"),
+            SubnetMask::Slash8 => write!(f, "{}.x.x.x", octets[0]),
+            SubnetMask::Slash16 => write!(f, "{}.{}.x.x", octets[0], octets[1]),
+            SubnetMask::Slash24 => write!(f, "{}.{}.{}.x", octets[0], octets[1], octets[2]),
+            SubnetMask::Slash32 => {
+                write!(f, "{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+            }
         }
     }
 }
@@ -147,23 +101,28 @@ impl FromStr for Subnet {
 
         Ok(match blocks {
             [ByteBlock::WildCard, ByteBlock::WildCard, ByteBlock::WildCard, ByteBlock::WildCard] => {
-                Subnet::new([0, 0, 0, 0].into(), SubnetClass::All)
+                Subnet::new([0, 0, 0, 0].into(), SubnetMask::Slash0)
             }
             [ByteBlock::Int(a), ByteBlock::WildCard, ByteBlock::WildCard, ByteBlock::WildCard] => {
-                Subnet::new([a, 0, 0, 0].into(), SubnetClass::A)
+                Subnet::new([a, 0, 0, 0].into(), SubnetMask::Slash8)
             }
             [ByteBlock::Int(a), ByteBlock::Int(b), ByteBlock::WildCard, ByteBlock::WildCard] => {
-                Subnet::new([a, b, 0, 0].into(), SubnetClass::B)
+                Subnet::new([a, b, 0, 0].into(), SubnetMask::Slash16)
             }
             [ByteBlock::Int(a), ByteBlock::Int(b), ByteBlock::Int(c), ByteBlock::WildCard] => {
-                Subnet::new([a, b, c, 0].into(), SubnetClass::C)
+                Subnet::new([a, b, c, 0].into(), SubnetMask::Slash24)
             }
             [ByteBlock::Int(a), ByteBlock::Int(b), ByteBlock::Int(c), ByteBlock::Int(d)] => {
-                Subnet::new([a, b, c, d].into(), SubnetClass::D)
+                Subnet::new([a, b, c, d].into(), SubnetMask::Slash32)
             }
             _ => return Err(SubnetParseError),
         })
     }
+}
+
+enum ByteBlock {
+    Int(u8),
+    WildCard,
 }
 
 fn parse_byte_blocks(input: &str) -> IResult<&str, [ByteBlock; 4]> {
@@ -189,11 +148,6 @@ fn parse_byte_block(input: &str) -> IResult<&str, ByteBlock> {
     }
 }
 
-enum ByteBlock {
-    Int(u8),
-    WildCard,
-}
-
 pub struct SubnetIterator {
     base_subnet: Subnet,
     range: RangeInclusive<u8>,
@@ -212,20 +166,20 @@ impl Iterator for SubnetIterator {
     type Item = Subnet;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let new_class = match self.base_subnet.class {
-            SubnetClass::All => SubnetClass::A,
-            SubnetClass::A => SubnetClass::B,
-            SubnetClass::B => SubnetClass::C,
-            SubnetClass::C => SubnetClass::D,
-            SubnetClass::D => return None,
+        let new_class = match self.base_subnet.mask {
+            SubnetMask::Slash0 => SubnetMask::Slash8,
+            SubnetMask::Slash8 => SubnetMask::Slash16,
+            SubnetMask::Slash16 => SubnetMask::Slash24,
+            SubnetMask::Slash24 => SubnetMask::Slash32,
+            SubnetMask::Slash32 => return None,
         };
 
         let idx = match new_class {
-            SubnetClass::All => unreachable!(),
-            SubnetClass::A => 0,
-            SubnetClass::B => 1,
-            SubnetClass::C => 2,
-            SubnetClass::D => 3,
+            SubnetMask::Slash0 => unreachable!(),
+            SubnetMask::Slash8 => 0,
+            SubnetMask::Slash16 => 1,
+            SubnetMask::Slash24 => 2,
+            SubnetMask::Slash32 => 3,
         };
 
         let mut octets = self.base_subnet.base_address.octets();
@@ -234,17 +188,4 @@ impl Iterator for SubnetIterator {
 
         Some(Subnet::new(octets.into(), new_class))
     }
-}
-
-pub type ClassBResult = Arc<[Option<ClassCResult>; 256]>;
-pub type ClassAResult = Arc<[Option<ClassBResult>; 256]>;
-pub type ClassCResult = Arc<[ClassDResult; 256]>;
-pub type ClassDResult = PingResult;
-
-#[derive(Debug, Clone)]
-pub enum SubnetClassResults {
-    ClassA(ClassAResult),
-    ClassB(ClassBResult),
-    ClassC(ClassCResult),
-    ClassD(ClassDResult),
 }
