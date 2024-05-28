@@ -9,7 +9,10 @@ use futures::future::join_all;
 
 use ping_the_internet::{
     file::{read_slash_16, save_slash_16},
-    gui::{self, Slash16State, Slash32State, CURRENT_START_TIME, PENDING_SLASH_16, SLASH_16_STATES, SLASH_32_STATES},
+    gui::{
+        self, Slash16State, Slash32State, CURRENT_START_TIME, PENDING_SLASH_16, SLASH_16_STATES,
+        SLASH_32_STATES,
+    },
     ping::{ping, PingResult},
     stats::{
         print_stats_table_header, print_stats_table_row, Analysis, Slash16Result, SubnetResults,
@@ -18,8 +21,6 @@ use ping_the_internet::{
 };
 
 fn main() {
-    console_subscriber::init();
-
     std::thread::spawn(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
