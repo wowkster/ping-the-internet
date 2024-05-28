@@ -123,15 +123,6 @@ pub async fn ping(address: Ipv4Addr) -> PingResult {
             }
         };
 
-        {
-            let i = address.octets()[2] as usize;
-            let j = address.octets()[3] as usize;
-
-            let mut states = SLASH_32_STATES.lock().unwrap();
-
-            states[i][j] = Slash32State::Pending;
-        }
-
         let state = match result {
             PingResult::Success(_) => Slash32State::Success,
             PingResult::Timeout => Slash32State::Timeout,
