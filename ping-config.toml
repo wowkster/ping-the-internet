@@ -1,0 +1,6 @@
+[workers]
+kind = "local"
+count = 8
+max_connections = 1024
+retry_limit = 2
+timeout = 3500
